@@ -8,7 +8,7 @@ from scipy.signal import stft, detrend, butter, filtfilt, find_peaks
 from scipy.interpolate import interp1d
 
 
-st.set_page_config(page_title="Registros e espectrogramas por faixas", layout="wide")
+st.set_page_config(page_title="Registros, espectrogramas e RMS por faixas", layout="wide")
 
 
 def detectar_delimitador(file_bytes: bytes) -> str | None:
@@ -197,6 +197,14 @@ def detectar_eventos_baixa_frequencia(
     return eventos, props
 
 
+def calcular_rms(y: np.ndarray):
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) == 0:
+        return np.nan
+    return np.sqrt(np.mean(y ** 2))
+
+
 def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplitude"):
     fig, ax = plt.subplots(figsize=(10, 3.5))
     ax.plot(t, y)
@@ -260,7 +268,7 @@ def figura_espectrograma(
     return fig
 
 
-st.title("Registros e espectrogramas por faixas de frequência")
+st.title("Registros, espectrogramas e RMS por faixas de frequência")
 
 uploaded_file = st.file_uploader(
     "Carregue um arquivo TXT ou CSV contendo a coluna de tempo e os canais",
@@ -401,6 +409,9 @@ if uploaded_file is not None:
             step=1,
         )
 
+        st.markdown("### RMS")
+        mostrar_tabela_rms = st.checkbox("Mostrar tabela-resumo de RMS por canal", value=True)
+
     st.subheader("Resumo do sinal original")
     c1, c2, c3 = st.columns(3)
     c1.metric("Número de amostras", f"{len(df)}")
@@ -410,7 +421,6 @@ if uploaded_file is not None:
     else:
         c3.metric("Frequência estimada original (Hz)", "indisponível")
 
-    # Canal Z como referência global
     try:
         y_z = df["Z"].to_numpy(dtype=float)
         mask_z = np.isfinite(tempo_s) & np.isfinite(y_z)
@@ -469,6 +479,8 @@ if uploaded_file is not None:
         st.warning("Selecione ao menos um canal.")
         st.stop()
 
+    resultados_rms = []
+
     for canal in canais_escolhidos:
         st.markdown(f"## Canal {canal}")
         y = df[canal].to_numpy(dtype=float)
@@ -497,6 +509,19 @@ if uploaded_file is not None:
                 ordem=int(ordem_filtro),
             )
 
+            rms_total = calcular_rms(y_proc)
+            rms_low = calcular_rms(y_low)
+            rms_high = calcular_rms(y_high)
+            indice_espectral = rms_high / rms_low if np.isfinite(rms_low) and rms_low > 0 else np.nan
+
+            resultados_rms.append({
+                "canal": canal,
+                "RMS_total": rms_total,
+                f"RMS_0_a_{fc_split:.2f}_Hz": rms_low,
+                f"RMS_acima_{fc_split:.2f}_Hz": rms_high,
+                "indice_espectral_high_low": indice_espectral,
+            })
+
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
             continue
@@ -505,6 +530,12 @@ if uploaded_file is not None:
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
         m3.metric("Eventos marcados", f"{len(tempos_eventos_z)}")
+
+        m4, m5, m6, m7 = st.columns(4)
+        m4.metric("RMS total", f"{rms_total:.4f}")
+        m5.metric(f"RMS < {fc_split:.1f} Hz", f"{rms_low:.4f}")
+        m6.metric(f"RMS > {fc_split:.1f} Hz", f"{rms_high:.4f}")
+        m7.metric("Índice high/low", f"{indice_espectral:.4f}" if np.isfinite(indice_espectral) else "nan")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
             fig_total = figura_registro_com_linhas(
@@ -585,6 +616,19 @@ if uploaded_file is not None:
                         tempos_eventos=tempos_eventos_z,
                     )
                     st.pyplot(fig_spec_high, use_container_width=True)
+
+    if mostrar_tabela_rms and len(resultados_rms) > 0:
+        st.subheader("Tabela-resumo de RMS por canal")
+        df_rms = pd.DataFrame(resultados_rms)
+        st.dataframe(df_rms, use_container_width=True)
+
+        csv_rms = df_rms.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Baixar tabela de RMS em CSV",
+            data=csv_rms,
+            file_name="resumo_rms_por_canal.csv",
+            mime="text/csv",
+        )
 
 else:
     st.info("Envie um arquivo para começar.")
