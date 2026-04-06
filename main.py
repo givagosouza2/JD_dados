@@ -8,7 +8,7 @@ from scipy.signal import stft, detrend, butter, filtfilt, find_peaks
 from scipy.interpolate import interp1d
 
 
-st.set_page_config(page_title="Registros, espectrogramas e RMS por faixas", layout="wide")
+st.set_page_config(page_title="Registros por faixas com envelope RMS", layout="wide")
 
 
 def detectar_delimitador(file_bytes: bytes) -> str | None:
@@ -197,17 +197,22 @@ def detectar_eventos_baixa_frequencia(
     return eventos, props
 
 
-def calcular_rms(y: np.ndarray):
+def calcular_envelope_rms(y: np.ndarray, fs: float, janela_s: float = 0.25):
     y = np.asarray(y, dtype=float)
-    y = y[np.isfinite(y)]
-    if len(y) == 0:
-        return np.nan
-    return np.sqrt(np.mean(y ** 2))
+    n_janela = max(1, int(round(janela_s * fs)))
+
+    if n_janela < 1:
+        n_janela = 1
+
+    kernel = np.ones(n_janela, dtype=float) / n_janela
+    potencia_media = np.convolve(y ** 2, kernel, mode="same")
+    envelope = np.sqrt(np.maximum(potencia_media, 0))
+    return envelope
 
 
 def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplitude"):
     fig, ax = plt.subplots(figsize=(10, 3.5))
-    ax.plot(t, y)
+    ax.plot(t, y, linewidth=1.0)
 
     if tempos_eventos is not None:
         for tp in tempos_eventos:
@@ -217,6 +222,35 @@ def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplit
     ax.set_xlabel("Tempo (s)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def figura_registro_high_com_envelope(
+    t,
+    y_high,
+    envelope_rms,
+    titulo,
+    tempos_eventos=None,
+    ylabel="Amplitude",
+    mostrar_envelope_negativo=True,
+):
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+
+    ax.plot(t, y_high, linewidth=0.9, label="Sinal > fc")
+    ax.plot(t, envelope_rms, linewidth=2.0, label="Envelope RMS")
+    if mostrar_envelope_negativo:
+        ax.plot(t, -envelope_rms, linewidth=2.0, linestyle="--", label="-Envelope RMS")
+
+    if tempos_eventos is not None:
+        for tp in tempos_eventos:
+            ax.axvline(tp, linestyle="--", linewidth=1.0, color="red")
+
+    ax.set_title(titulo)
+    ax.set_xlabel("Tempo (s)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.tight_layout()
     return fig
 
@@ -268,7 +302,7 @@ def figura_espectrograma(
     return fig
 
 
-st.title("Registros, espectrogramas e RMS por faixas de frequência")
+st.title("Registros e espectrogramas por faixas de frequência com envelope RMS")
 
 uploaded_file = st.file_uploader(
     "Carregue um arquivo TXT ou CSV contendo a coluna de tempo e os canais",
@@ -349,6 +383,18 @@ if uploaded_file is not None:
             step=1,
         )
 
+        st.markdown("### Envelope RMS da banda alta")
+        janela_rms_s = st.number_input(
+            "Janela do envelope RMS (s)",
+            min_value=0.01,
+            value=0.25,
+            step=0.01,
+        )
+        mostrar_envelope_negativo = st.checkbox(
+            "Mostrar envelope RMS negativo",
+            value=True,
+        )
+
         st.markdown("### Eventos no canal Z abaixo de 2 Hz")
         modo_evento_z = st.selectbox(
             "Tipo de evento a detectar em Z < 2 Hz",
@@ -408,9 +454,6 @@ if uploaded_file is not None:
             value=min(192, nperseg - 1),
             step=1,
         )
-
-        st.markdown("### RMS")
-        mostrar_tabela_rms = st.checkbox("Mostrar tabela-resumo de RMS por canal", value=True)
 
     st.subheader("Resumo do sinal original")
     c1, c2, c3 = st.columns(3)
@@ -479,8 +522,6 @@ if uploaded_file is not None:
         st.warning("Selecione ao menos um canal.")
         st.stop()
 
-    resultados_rms = []
-
     for canal in canais_escolhidos:
         st.markdown(f"## Canal {canal}")
         y = df[canal].to_numpy(dtype=float)
@@ -509,33 +550,21 @@ if uploaded_file is not None:
                 ordem=int(ordem_filtro),
             )
 
-            rms_total = calcular_rms(y_proc)
-            rms_low = calcular_rms(y_low)
-            rms_high = calcular_rms(y_high)
-            indice_espectral = rms_high / rms_low if np.isfinite(rms_low) and rms_low > 0 else np.nan
-
-            resultados_rms.append({
-                "canal": canal,
-                "RMS_total": rms_total,
-                f"RMS_0_a_{fc_split:.2f}_Hz": rms_low,
-                f"RMS_acima_{fc_split:.2f}_Hz": rms_high,
-                "indice_espectral_high_low": indice_espectral,
-            })
+            env_rms_high = calcular_envelope_rms(
+                y_high,
+                fs_proc,
+                janela_s=float(janela_rms_s),
+            )
 
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
             continue
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
         m3.metric("Eventos marcados", f"{len(tempos_eventos_z)}")
-
-        m4, m5, m6, m7 = st.columns(4)
-        m4.metric("RMS total", f"{rms_total:.4f}")
-        m5.metric(f"RMS < {fc_split:.1f} Hz", f"{rms_low:.4f}")
-        m6.metric(f"RMS > {fc_split:.1f} Hz", f"{rms_high:.4f}")
-        m7.metric("Índice high/low", f"{indice_espectral:.4f}" if np.isfinite(indice_espectral) else "nan")
+        m4.metric("Janela RMS (s)", f"{janela_rms_s:.2f}")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
             fig_total = figura_registro_com_linhas(
@@ -558,28 +587,33 @@ if uploaded_file is not None:
                 st.pyplot(fig_low, use_container_width=True)
 
             with col2:
-                fig_high = figura_registro_com_linhas(
+                fig_high_env = figura_registro_high_com_envelope(
                     t_proc,
                     y_high,
-                    f"Registro acima de {fc_split:.1f} Hz - canal {canal}",
+                    env_rms_high,
+                    f"Registro acima de {fc_split:.1f} Hz com envelope RMS - canal {canal}",
                     tempos_eventos=tempos_eventos_z,
+                    mostrar_envelope_negativo=mostrar_envelope_negativo,
                 )
-                st.pyplot(fig_high, use_container_width=True)
+                st.pyplot(fig_high_env, use_container_width=True)
 
-        with st.expander(f"Tabela de amplitudes nos tempos de referência - canal {canal}", expanded=False):
-            if len(tempos_eventos_z) > 0:
-                idx_ref = np.searchsorted(t_proc, tempos_eventos_z)
-                idx_ref = np.clip(idx_ref, 0, len(t_proc) - 1)
+        with st.expander(f"Tabela do sinal > {fc_split:.1f} Hz e envelope RMS - canal {canal}", expanded=False):
+            df_high_env = pd.DataFrame({
+                "tempo_s": t_proc,
+                "sinal_alta_freq": y_high,
+                "envelope_rms": env_rms_high,
+                "envelope_rms_negativo": -env_rms_high,
+            })
+            st.dataframe(df_high_env, use_container_width=True)
 
-                df_ref_canal = pd.DataFrame({
-                    "tempo_ref_s": t_proc[idx_ref],
-                    "amplitude_total": y_proc[idx_ref],
-                    "amplitude_baixa_freq": y_low[idx_ref],
-                    "amplitude_alta_freq": y_high[idx_ref],
-                })
-                st.dataframe(df_ref_canal, use_container_width=True)
-            else:
-                st.info("Não há eventos de referência para mostrar.")
+            csv_high_env = df_high_env.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"Baixar CSV do canal {canal} com envelope RMS",
+                data=csv_high_env,
+                file_name=f"{canal}_alta_freq_envelope_rms.csv",
+                mime="text/csv",
+                key=f"download_{canal}",
+            )
 
         if mostrar_espectrogramas:
             with st.expander(f"Espectrogramas - canal {canal}", expanded=True):
@@ -616,19 +650,6 @@ if uploaded_file is not None:
                         tempos_eventos=tempos_eventos_z,
                     )
                     st.pyplot(fig_spec_high, use_container_width=True)
-
-    if mostrar_tabela_rms and len(resultados_rms) > 0:
-        st.subheader("Tabela-resumo de RMS por canal")
-        df_rms = pd.DataFrame(resultados_rms)
-        st.dataframe(df_rms, use_container_width=True)
-
-        csv_rms = df_rms.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Baixar tabela de RMS em CSV",
-            data=csv_rms,
-            file_name="resumo_rms_por_canal.csv",
-            mime="text/csv",
-        )
 
 else:
     st.info("Envie um arquivo para começar.")
