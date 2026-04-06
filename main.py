@@ -8,7 +8,7 @@ from scipy.signal import stft, detrend, butter, filtfilt, find_peaks
 from scipy.interpolate import interp1d
 
 
-st.set_page_config(page_title="Registros por faixas com envelope RMS", layout="wide")
+st.set_page_config(page_title="Registros por faixas com envelopes", layout="wide")
 
 
 def detectar_delimitador(file_bytes: bytes) -> str | None:
@@ -200,14 +200,18 @@ def detectar_eventos_baixa_frequencia(
 def calcular_envelope_rms(y: np.ndarray, fs: float, janela_s: float = 0.25):
     y = np.asarray(y, dtype=float)
     n_janela = max(1, int(round(janela_s * fs)))
-
-    if n_janela < 1:
-        n_janela = 1
-
     kernel = np.ones(n_janela, dtype=float) / n_janela
     potencia_media = np.convolve(y ** 2, kernel, mode="same")
     envelope = np.sqrt(np.maximum(potencia_media, 0))
     return envelope
+
+
+def calcular_envelope_absoluto(y: np.ndarray, fs: float, janela_s: float = 0.25):
+    y = np.asarray(y, dtype=float)
+    n_janela = max(1, int(round(janela_s * fs)))
+    kernel = np.ones(n_janela, dtype=float) / n_janela
+    envelope_abs = np.convolve(np.abs(y), kernel, mode="same")
+    return envelope_abs
 
 
 def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplitude"):
@@ -239,8 +243,32 @@ def figura_registro_high_com_envelope(
 
     ax.plot(t, y_high, linewidth=0.9, label="Sinal > fc")
     ax.plot(t, envelope_rms, linewidth=2.0, label="Envelope RMS")
+
     if mostrar_envelope_negativo:
         ax.plot(t, -envelope_rms, linewidth=2.0, linestyle="--", label="-Envelope RMS")
+
+    if tempos_eventos is not None:
+        for tp in tempos_eventos:
+            ax.axvline(tp, linestyle="--", linewidth=1.0, color="red")
+
+    ax.set_title(titulo)
+    ax.set_xlabel("Tempo (s)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def figura_envelope_absoluto(
+    t,
+    envelope_abs,
+    titulo,
+    tempos_eventos=None,
+    ylabel="Envelope |sinal|",
+):
+    fig, ax = plt.subplots(figsize=(10, 3.5))
+    ax.plot(t, envelope_abs, linewidth=2.0, label="Envelope dos valores absolutos")
 
     if tempos_eventos is not None:
         for tp in tempos_eventos:
@@ -302,7 +330,7 @@ def figura_espectrograma(
     return fig
 
 
-st.title("Registros e espectrogramas por faixas de frequência com envelope RMS")
+st.title("Registros e espectrogramas por faixas de frequência com envelopes")
 
 uploaded_file = st.file_uploader(
     "Carregue um arquivo TXT ou CSV contendo a coluna de tempo e os canais",
@@ -393,6 +421,14 @@ if uploaded_file is not None:
         mostrar_envelope_negativo = st.checkbox(
             "Mostrar envelope RMS negativo",
             value=True,
+        )
+
+        st.markdown("### Envelope absoluto da banda alta")
+        janela_abs_s = st.number_input(
+            "Janela do envelope absoluto (s)",
+            min_value=0.01,
+            value=0.25,
+            step=0.01,
         )
 
         st.markdown("### Eventos no canal Z abaixo de 2 Hz")
@@ -556,15 +592,22 @@ if uploaded_file is not None:
                 janela_s=float(janela_rms_s),
             )
 
+            env_abs_high = calcular_envelope_absoluto(
+                y_high,
+                fs_proc,
+                janela_s=float(janela_abs_s),
+            )
+
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
             continue
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
         m3.metric("Eventos marcados", f"{len(tempos_eventos_z)}")
         m4.metric("Janela RMS (s)", f"{janela_rms_s:.2f}")
+        m5.metric("Janela abs (s)", f"{janela_abs_s:.2f}")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
             fig_total = figura_registro_com_linhas(
@@ -597,20 +640,29 @@ if uploaded_file is not None:
                 )
                 st.pyplot(fig_high_env, use_container_width=True)
 
-        with st.expander(f"Tabela do sinal > {fc_split:.1f} Hz e envelope RMS - canal {canal}", expanded=False):
+            fig_abs_env = figura_envelope_absoluto(
+                t_proc,
+                env_abs_high,
+                f"Envelope dos valores absolutos do registro acima de {fc_split:.1f} Hz - canal {canal}",
+                tempos_eventos=tempos_eventos_z,
+            )
+            st.pyplot(fig_abs_env, use_container_width=True)
+
+        with st.expander(f"Tabela do sinal > {fc_split:.1f} Hz e envelopes - canal {canal}", expanded=False):
             df_high_env = pd.DataFrame({
                 "tempo_s": t_proc,
                 "sinal_alta_freq": y_high,
                 "envelope_rms": env_rms_high,
                 "envelope_rms_negativo": -env_rms_high,
+                "envelope_absoluto": env_abs_high,
             })
             st.dataframe(df_high_env, use_container_width=True)
 
             csv_high_env = df_high_env.to_csv(index=False).encode("utf-8")
             st.download_button(
-                f"Baixar CSV do canal {canal} com envelope RMS",
+                f"Baixar CSV do canal {canal} com envelopes",
                 data=csv_high_env,
-                file_name=f"{canal}_alta_freq_envelope_rms.csv",
+                file_name=f"{canal}_alta_freq_envelopes.csv",
                 mime="text/csv",
                 key=f"download_{canal}",
             )
