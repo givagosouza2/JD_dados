@@ -169,15 +169,21 @@ def decompor_faixas(y: np.ndarray, fs: float, fc: float = 2.0, ordem: int = 4):
     return y_low, y_high
 
 
-def detectar_picos_baixa_frequencia(
+def detectar_eventos_baixa_frequencia(
     y_low: np.ndarray,
     fs: float,
+    modo: str = "Picos",
     fator_altura: float = 1.0,
     distancia_min_s: float = 1.0,
     prominencia: float | None = None,
 ):
-    altura_min = fator_altura * np.std(y_low)
     distancia_min_amostras = max(1, int(distancia_min_s * fs))
+    altura_min = fator_altura * np.std(y_low)
+
+    if modo == "Picos":
+        y_busca = y_low
+    else:
+        y_busca = -y_low
 
     kwargs = {
         "height": altura_min,
@@ -187,8 +193,8 @@ def detectar_picos_baixa_frequencia(
     if prominencia is not None and prominencia > 0:
         kwargs["prominence"] = prominencia
 
-    peaks, props = find_peaks(y_low, **kwargs)
-    return peaks, props
+    eventos, props = find_peaks(y_busca, **kwargs)
+    return eventos, props
 
 
 def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplitude"):
@@ -215,6 +221,7 @@ def figura_espectrograma(
     fmax=5.0,
     nperseg=256,
     noverlap=192,
+    tempos_eventos=None,
 ):
     if len(y) < nperseg:
         nperseg = max(32, len(y) // 2)
@@ -239,6 +246,11 @@ def figura_espectrograma(
 
     fig, ax = plt.subplots(figsize=(10, 4.0))
     pcm = ax.pcolormesh(tt, f_plot, mag_plot, shading="gouraud")
+
+    if tempos_eventos is not None:
+        for tp in tempos_eventos:
+            ax.axvline(tp, linestyle="--", linewidth=1.0, color="red")
+
     ax.set_title(titulo)
     ax.set_xlabel("Tempo (s)")
     ax.set_ylabel("Frequência (Hz)")
@@ -283,6 +295,10 @@ if uploaded_file is not None:
         st.error("Nenhum canal numérico foi encontrado além da coluna de tempo.")
         st.stop()
 
+    if "Z" not in canais:
+        st.error("O arquivo não possui o canal Z, que será usado como referência.")
+        st.stop()
+
     with st.sidebar:
         st.header("Configurações")
 
@@ -325,19 +341,27 @@ if uploaded_file is not None:
             step=1,
         )
 
-        st.markdown("### Picos na faixa < 2 Hz")
+        st.markdown("### Eventos no canal Z abaixo de 2 Hz")
+        modo_evento_z = st.selectbox(
+            "Tipo de evento a detectar em Z < 2 Hz",
+            ["Picos", "Vales"],
+            index=0,
+        )
+
         fator_altura = st.number_input(
-            "Limiar dos picos (multiplicador do desvio-padrão)",
+            "Limiar dos eventos (multiplicador do desvio-padrão)",
             min_value=0.1,
             value=1.0,
             step=0.1,
         )
+
         distancia_min_s = st.number_input(
-            "Distância mínima entre picos lentos (s)",
+            "Distância mínima entre eventos lentos (s)",
             min_value=0.05,
             value=1.0,
             step=0.05,
         )
+
         usar_prominencia = st.checkbox("Usar proeminência mínima", value=False)
         prominencia = None
         if usar_prominencia:
@@ -348,12 +372,14 @@ if uploaded_file is not None:
                 step=0.01,
             )
 
-        st.markdown("### STFT")
+        st.markdown("### Exibição")
         canais_escolhidos = st.multiselect(
             "Canais para exibir",
             options=canais,
             default=canais,
         )
+
+        mostrar_espectrogramas = st.checkbox("Mostrar espectrogramas", value=True)
 
         fs_exibicao = fs_interp if fazer_interpolacao else (
             float(fs_auto) if np.isfinite(fs_auto) else 100.0
@@ -383,6 +409,61 @@ if uploaded_file is not None:
         c3.metric("Frequência estimada original (Hz)", f"{fs_auto:.2f}")
     else:
         c3.metric("Frequência estimada original (Hz)", "indisponível")
+
+    # Canal Z como referência global
+    try:
+        y_z = df["Z"].to_numpy(dtype=float)
+        mask_z = np.isfinite(tempo_s) & np.isfinite(y_z)
+        t_z = tempo_s[mask_z]
+        y_z = y_z[mask_z]
+
+        t_z_proc, y_z_proc, fs_z_proc = preprocessar_sinal(
+            t_z,
+            y_z,
+            fazer_detrend=fazer_detrend,
+            fazer_interpolacao=fazer_interpolacao,
+            fs_interp=float(fs_interp),
+        )
+
+        y_z_low, y_z_high = decompor_faixas(
+            y_z_proc,
+            fs_z_proc,
+            fc=float(fc_split),
+            ordem=int(ordem_filtro),
+        )
+
+        eventos_z_low, _ = detectar_eventos_baixa_frequencia(
+            y_z_low,
+            fs_z_proc,
+            modo=modo_evento_z,
+            fator_altura=float(fator_altura),
+            distancia_min_s=float(distancia_min_s),
+            prominencia=prominencia,
+        )
+
+        tempos_eventos_z = t_z_proc[eventos_z_low]
+
+    except Exception as e:
+        st.error(f"Erro ao processar o canal Z para obter os eventos de referência: {e}")
+        st.stop()
+
+    st.subheader("Referência global de eventos")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Canal de referência", "Z")
+    a2.metric("Tipo de evento", modo_evento_z)
+    a3.metric("Número de eventos", f"{len(tempos_eventos_z)}")
+
+    with st.expander("Tabela de eventos detectados em Z < 2 Hz", expanded=False):
+        if len(tempos_eventos_z) > 0:
+            df_ref = pd.DataFrame({
+                "indice_Z": eventos_z_low,
+                "tempo_s": tempos_eventos_z,
+                "amplitude_Z_baixa_freq": y_z_low[eventos_z_low],
+                "amplitude_Z_alta_freq_mesmo_tempo": y_z_high[eventos_z_low],
+            })
+            st.dataframe(df_ref, use_container_width=True)
+        else:
+            st.info("Nenhum evento foi detectado no canal Z abaixo de 2 Hz.")
 
     if not canais_escolhidos:
         st.warning("Selecione ao menos um canal.")
@@ -416,32 +497,21 @@ if uploaded_file is not None:
                 ordem=int(ordem_filtro),
             )
 
-            peaks_low, props = detectar_picos_baixa_frequencia(
-                y_low,
-                fs_proc,
-                fator_altura=float(fator_altura),
-                distancia_min_s=float(distancia_min_s),
-                prominencia=prominencia,
-            )
-
-            tempos_picos = t_proc[peaks_low]
-
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
             continue
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
-        m3.metric("Corte entre bandas (Hz)", f"{fc_split:.2f}")
-        m4.metric("Número de picos lentos", f"{len(peaks_low)}")
+        m3.metric("Eventos marcados", f"{len(tempos_eventos_z)}")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
             fig_total = figura_registro_com_linhas(
                 t_proc,
                 y_proc,
                 f"Registro processado total - canal {canal}",
-                tempos_eventos=tempos_picos,
+                tempos_eventos=tempos_eventos_z,
             )
             st.pyplot(fig_total, use_container_width=True)
 
@@ -452,7 +522,7 @@ if uploaded_file is not None:
                     t_proc,
                     y_low,
                     f"Registro 0 a {fc_split:.1f} Hz - canal {canal}",
-                    tempos_eventos=tempos_picos,
+                    tempos_eventos=tempos_eventos_z,
                 )
                 st.pyplot(fig_low, use_container_width=True)
 
@@ -461,54 +531,60 @@ if uploaded_file is not None:
                     t_proc,
                     y_high,
                     f"Registro acima de {fc_split:.1f} Hz - canal {canal}",
-                    tempos_eventos=tempos_picos,
+                    tempos_eventos=tempos_eventos_z,
                 )
                 st.pyplot(fig_high, use_container_width=True)
 
-        with st.expander(f"Tabela de picos lentos - canal {canal}", expanded=False):
-            if len(peaks_low) > 0:
-                df_picos = pd.DataFrame({
-                    "indice": peaks_low,
-                    "tempo_s": t_proc[peaks_low],
-                    "amplitude_baixa_freq": y_low[peaks_low],
-                    "amplitude_alta_freq_mesmo_tempo": y_high[peaks_low],
+        with st.expander(f"Tabela de amplitudes nos tempos de referência - canal {canal}", expanded=False):
+            if len(tempos_eventos_z) > 0:
+                idx_ref = np.searchsorted(t_proc, tempos_eventos_z)
+                idx_ref = np.clip(idx_ref, 0, len(t_proc) - 1)
+
+                df_ref_canal = pd.DataFrame({
+                    "tempo_ref_s": t_proc[idx_ref],
+                    "amplitude_total": y_proc[idx_ref],
+                    "amplitude_baixa_freq": y_low[idx_ref],
+                    "amplitude_alta_freq": y_high[idx_ref],
                 })
-                st.dataframe(df_picos, use_container_width=True)
+                st.dataframe(df_ref_canal, use_container_width=True)
             else:
-                st.info("Nenhum pico foi detectado na faixa abaixo de 2 Hz com os parâmetros atuais.")
+                st.info("Não há eventos de referência para mostrar.")
 
-        with st.expander(f"Espectrogramas - canal {canal}", expanded=True):
-            col3, col4 = st.columns(2)
+        if mostrar_espectrogramas:
+            with st.expander(f"Espectrogramas - canal {canal}", expanded=True):
+                col3, col4 = st.columns(2)
 
-            with col3:
-                fig_spec_low = figura_espectrograma(
-                    y_low,
-                    fs_proc,
-                    f"Espectrograma 0 a {fc_split:.1f} Hz - canal {canal}",
-                    fmin=0.0,
-                    fmax=float(fc_split),
-                    nperseg=nperseg,
-                    noverlap=noverlap,
-                )
-                st.pyplot(fig_spec_low, use_container_width=True)
+                with col3:
+                    fig_spec_low = figura_espectrograma(
+                        y_low,
+                        fs_proc,
+                        f"Espectrograma 0 a {fc_split:.1f} Hz - canal {canal}",
+                        fmin=0.0,
+                        fmax=float(fc_split),
+                        nperseg=nperseg,
+                        noverlap=noverlap,
+                        tempos_eventos=tempos_eventos_z,
+                    )
+                    st.pyplot(fig_spec_low, use_container_width=True)
 
-            with col4:
-                fmax_high = min(fmax_total, fs_proc / 2.0)
-                fmin_high = float(fc_split)
+                with col4:
+                    fmax_high = min(fmax_total, fs_proc / 2.0)
+                    fmin_high = float(fc_split)
 
-                if fmin_high >= fmax_high:
-                    fmin_high = max(0.0, fmax_high - 0.5)
+                    if fmin_high >= fmax_high:
+                        fmin_high = max(0.0, fmax_high - 0.5)
 
-                fig_spec_high = figura_espectrograma(
-                    y_high,
-                    fs_proc,
-                    f"Espectrograma acima de {fc_split:.1f} Hz - canal {canal}",
-                    fmin=fmin_high,
-                    fmax=fmax_high,
-                    nperseg=nperseg,
-                    noverlap=noverlap,
-                )
-                st.pyplot(fig_spec_high, use_container_width=True)
+                    fig_spec_high = figura_espectrograma(
+                        y_high,
+                        fs_proc,
+                        f"Espectrograma acima de {fc_split:.1f} Hz - canal {canal}",
+                        fmin=fmin_high,
+                        fmax=fmax_high,
+                        nperseg=nperseg,
+                        noverlap=noverlap,
+                        tempos_eventos=tempos_eventos_z,
+                    )
+                    st.pyplot(fig_spec_high, use_container_width=True)
 
 else:
     st.info("Envie um arquivo para começar.")
