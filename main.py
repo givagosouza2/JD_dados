@@ -1,15 +1,14 @@
-
 import io
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from scipy.signal import stft, detrend, butter, filtfilt
+from scipy.signal import stft, detrend, butter, filtfilt, find_peaks
 from scipy.interpolate import interp1d
 
 
-st.set_page_config(page_title="Espectrograma por Canal", layout="wide")
+st.set_page_config(page_title="Registros e espectrogramas por faixas", layout="wide")
 
 
 def detectar_delimitador(file_bytes: bytes) -> str | None:
@@ -27,6 +26,7 @@ def carregar_dados(uploaded_file) -> pd.DataFrame:
     tentativas = []
     if sep is not None:
         tentativas.append({"sep": sep})
+
     tentativas += [
         {"sep": None, "delim_whitespace": True},
         {"sep": ","},
@@ -50,13 +50,16 @@ def carregar_dados(uploaded_file) -> pd.DataFrame:
 def encontrar_coluna_tempo(df: pd.DataFrame) -> str | None:
     nomes = [c.lower().strip() for c in df.columns]
     prioridades = ["tempo", "time", "timestamp", "t"]
+
     for p in prioridades:
         for col, nome in zip(df.columns, nomes):
             if nome == p:
                 return col
+
     for col, nome in zip(df.columns, nomes):
         if "tempo" in nome or "time" in nome:
             return col
+
     return None
 
 
@@ -64,8 +67,10 @@ def estimar_fs(tempo: np.ndarray, unidade_tempo: str) -> float:
     dt = np.diff(tempo)
     dt = dt[np.isfinite(dt)]
     dt = dt[dt > 0]
+
     if len(dt) == 0:
         raise ValueError("Não foi possível estimar a frequência de amostragem.")
+
     dt_mediano = np.median(dt)
 
     if unidade_tempo == "ms":
@@ -102,10 +107,17 @@ def interpolar_para_fs_fixa(t: np.ndarray, y: np.ndarray, fs_novo: float = 100.0
         raise ValueError("Tempo com poucas amostras únicas para interpolação.")
 
     t_uniforme = np.arange(t_unico[0], t_unico[-1], 1.0 / fs_novo)
+
     if len(t_uniforme) < 4:
         raise ValueError("Janela temporal insuficiente para interpolação.")
 
-    f_interp = interp1d(t_unico, y_unico, kind="linear", bounds_error=False, fill_value="extrapolate")
+    f_interp = interp1d(
+        t_unico,
+        y_unico,
+        kind="linear",
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
     y_interp = f_interp(t_uniforme)
 
     return t_uniforme, y_interp
@@ -115,11 +127,18 @@ def filtro_butter(y: np.ndarray, fs: float, fc: float, tipo: str, ordem: int = 4
     nyq = fs / 2.0
     if fc <= 0 or fc >= nyq:
         raise ValueError("A frequência de corte deve estar entre 0 e Nyquist.")
+
     b, a = butter(ordem, fc / nyq, btype=tipo)
     return filtfilt(b, a, y)
 
 
-def preprocessar_sinal(t, y, fazer_detrend=True, fazer_interpolacao=True, fs_interp=100.0):
+def preprocessar_sinal(
+    t,
+    y,
+    fazer_detrend=True,
+    fazer_interpolacao=True,
+    fs_interp=100.0,
+):
     t_proc = np.asarray(t, dtype=float)
     y_proc = np.asarray(y, dtype=float)
 
@@ -130,10 +149,12 @@ def preprocessar_sinal(t, y, fazer_detrend=True, fazer_interpolacao=True, fs_int
         mask = np.isfinite(t_proc) & np.isfinite(y_proc)
         t_proc = t_proc[mask]
         y_proc = y_proc[mask]
+
         dt = np.diff(t_proc)
         dt = dt[dt > 0]
         if len(dt) == 0:
             raise ValueError("Não foi possível estimar a frequência após remoção de NaNs.")
+
         fs_proc = 1.0 / np.median(dt)
 
     if fazer_detrend:
@@ -148,9 +169,37 @@ def decompor_faixas(y: np.ndarray, fs: float, fc: float = 2.0, ordem: int = 4):
     return y_low, y_high
 
 
-def figura_registro(t, y, titulo, ylabel="Amplitude"):
-    fig, ax = plt.subplots(figsize=(10, 3.4))
+def detectar_picos_alta_frequencia(
+    y_high: np.ndarray,
+    fs: float,
+    fator_altura: float = 1.0,
+    distancia_min_s: float = 0.2,
+):
+    altura_min = fator_altura * np.std(y_high)
+    distancia_min_amostras = max(1, int(distancia_min_s * fs))
+
+    peaks, props = find_peaks(
+        y_high,
+        height=altura_min,
+        distance=distancia_min_amostras,
+    )
+
+    return peaks, props
+
+
+def figura_registro_com_picos(
+    t,
+    y,
+    titulo,
+    peaks=None,
+    ylabel="Amplitude",
+):
+    fig, ax = plt.subplots(figsize=(10, 3.5))
     ax.plot(t, y)
+
+    if peaks is not None and len(peaks) > 0:
+        ax.scatter(t[peaks], y[peaks], s=30, zorder=3)
+
     ax.set_title(titulo)
     ax.set_xlabel("Tempo (s)")
     ax.set_ylabel(ylabel)
@@ -159,7 +208,19 @@ def figura_registro(t, y, titulo, ylabel="Amplitude"):
     return fig
 
 
-def figura_espectrograma(y, fs, titulo, fmin=0.0, fmax=5.0, nperseg=256, noverlap=192):
+def figura_espectrograma(
+    y,
+    fs,
+    titulo,
+    fmin=0.0,
+    fmax=5.0,
+    nperseg=256,
+    noverlap=192,
+):
+    if len(y) < nperseg:
+        nperseg = max(32, len(y) // 2)
+        noverlap = min(noverlap, max(0, nperseg - 1))
+
     f, tt, zxx = stft(
         y,
         fs=fs,
@@ -214,12 +275,9 @@ if uploaded_file is not None:
 
     colunas_numericas = []
     for col in df.columns:
-        try:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            if df[col].notna().sum() > 0:
-                colunas_numericas.append(col)
-        except Exception:
-            pass
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df[col].notna().sum() > 0:
+            colunas_numericas.append(col)
 
     canais = [c for c in colunas_numericas if c != col_tempo]
     if len(canais) == 0:
@@ -246,20 +304,68 @@ if uploaded_file is not None:
         st.markdown("### Pré-processamento")
         fazer_detrend = st.checkbox("Aplicar detrend linear", value=True)
         fazer_interpolacao = st.checkbox("Interpolar para frequência fixa", value=True)
-        fs_interp = st.number_input("Frequência após interpolação (Hz)", min_value=1.0, value=100.0, step=1.0)
+        fs_interp = st.number_input(
+            "Frequência após interpolação (Hz)",
+            min_value=1.0,
+            value=100.0,
+            step=1.0,
+        )
 
         st.markdown("### Separação por faixas")
-        fc_split = st.number_input("Frequência de corte entre bandas (Hz)", min_value=0.1, value=2.0, step=0.1)
-        ordem_filtro = st.slider("Ordem do filtro Butterworth", min_value=2, max_value=8, value=4, step=1)
+        fc_split = st.number_input(
+            "Frequência de corte entre bandas (Hz)",
+            min_value=0.1,
+            value=2.0,
+            step=0.1,
+        )
+        ordem_filtro = st.slider(
+            "Ordem do filtro Butterworth",
+            min_value=2,
+            max_value=8,
+            value=4,
+            step=1,
+        )
+
+        st.markdown("### Detecção de picos")
+        fator_altura = st.number_input(
+            "Limiar dos picos (multiplicador do desvio-padrão)",
+            min_value=0.1,
+            value=1.0,
+            step=0.1,
+        )
+        distancia_min_s = st.number_input(
+            "Distância mínima entre picos (s)",
+            min_value=0.01,
+            value=0.2,
+            step=0.01,
+        )
 
         st.markdown("### STFT")
-        canais_escolhidos = st.multiselect("Canais para exibir", options=canais, default=canais)
+        canais_escolhidos = st.multiselect(
+            "Canais para exibir",
+            options=canais,
+            default=canais,
+        )
 
-        fs_exibicao = fs_interp if fazer_interpolacao else (float(fs_auto) if np.isfinite(fs_auto) else 100.0)
+        fs_exibicao = fs_interp if fazer_interpolacao else (
+            float(fs_auto) if np.isfinite(fs_auto) else 100.0
+        )
         fmax_total = min(10.0, fs_exibicao / 2.0)
 
-        nperseg = st.slider("Tamanho da janela (nperseg)", min_value=32, max_value=1024, value=256, step=32)
-        noverlap = st.slider("Sobreposição (noverlap)", min_value=0, max_value=nperseg - 1, value=min(192, nperseg - 1), step=1)
+        nperseg = st.slider(
+            "Tamanho da janela (nperseg)",
+            min_value=32,
+            max_value=1024,
+            value=256,
+            step=32,
+        )
+        noverlap = st.slider(
+            "Sobreposição (noverlap)",
+            min_value=0,
+            max_value=nperseg - 1,
+            value=min(192, nperseg - 1),
+            step=1,
+        )
 
     st.subheader("Resumo do sinal original")
     c1, c2, c3 = st.columns(3)
@@ -294,32 +400,76 @@ if uploaded_file is not None:
                 fazer_interpolacao=fazer_interpolacao,
                 fs_interp=float(fs_interp),
             )
-            y_0_2, y_acima_2 = decompor_faixas(y_proc, fs_proc, fc=float(fc_split), ordem=int(ordem_filtro))
+
+            y_0_2, y_acima_2 = decompor_faixas(
+                y_proc,
+                fs_proc,
+                fc=float(fc_split),
+                ordem=int(ordem_filtro),
+            )
+
+            peaks, props = detectar_picos_alta_frequencia(
+                y_acima_2,
+                fs_proc,
+                fator_altura=float(fator_altura),
+                distancia_min_s=float(distancia_min_s),
+            )
+
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
             continue
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
         m3.metric("Corte entre bandas (Hz)", f"{fc_split:.2f}")
+        m4.metric("Número de picos", f"{len(peaks)}")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
-            fig0 = figura_registro(t_proc, y_proc, f"Registro processado total - canal {canal}")
-            st.pyplot(fig0, use_container_width=True)
+            fig_total = figura_registro_com_picos(
+                t_proc,
+                y_proc,
+                f"Registro processado total - canal {canal}",
+            )
+            st.pyplot(fig_total, use_container_width=True)
 
             col1, col2 = st.columns(2)
+
             with col1:
-                fig1 = figura_registro(t_proc, y_0_2, f"Registro 0 a {fc_split:.1f} Hz - canal {canal}")
-                st.pyplot(fig1, use_container_width=True)
+                fig_low = figura_registro_com_picos(
+                    t_proc,
+                    y_0_2,
+                    f"Registro 0 a {fc_split:.1f} Hz - canal {canal}",
+                    peaks=peaks,
+                )
+                st.pyplot(fig_low, use_container_width=True)
+
             with col2:
-                fig2 = figura_registro(t_proc, y_acima_2, f"Registro acima de {fc_split:.1f} Hz - canal {canal}")
-                st.pyplot(fig2, use_container_width=True)
+                fig_high = figura_registro_com_picos(
+                    t_proc,
+                    y_acima_2,
+                    f"Registro acima de {fc_split:.1f} Hz - canal {canal}",
+                    peaks=peaks,
+                )
+                st.pyplot(fig_high, use_container_width=True)
+
+        with st.expander(f"Tabela de picos - canal {canal}", expanded=False):
+            if len(peaks) > 0:
+                df_picos = pd.DataFrame({
+                    "indice": peaks,
+                    "tempo_s": t_proc[peaks],
+                    "amplitude_alta_freq": y_acima_2[peaks],
+                    "amplitude_baixa_freq": y_0_2[peaks],
+                })
+                st.dataframe(df_picos, use_container_width=True)
+            else:
+                st.info("Nenhum pico detectado com os parâmetros atuais.")
 
         with st.expander(f"Espectrogramas - canal {canal}", expanded=True):
             col3, col4 = st.columns(2)
+
             with col3:
-                fig3 = figura_espectrograma(
+                fig_spec_low = figura_espectrograma(
                     y_0_2,
                     fs_proc,
                     f"Espectrograma 0 a {fc_split:.1f} Hz - canal {canal}",
@@ -328,12 +478,16 @@ if uploaded_file is not None:
                     nperseg=nperseg,
                     noverlap=noverlap,
                 )
-                st.pyplot(fig3, use_container_width=True)
+                st.pyplot(fig_spec_low, use_container_width=True)
 
             with col4:
                 fmax_high = min(fmax_total, fs_proc / 2.0)
-                fmin_high = min(float(fc_split), max(0.0, fmax_high - 0.1))
-                fig4 = figura_espectrograma(
+                fmin_high = float(fc_split)
+
+                if fmin_high >= fmax_high:
+                    fmin_high = max(0.0, fmax_high - 0.5)
+
+                fig_spec_high = figura_espectrograma(
                     y_acima_2,
                     fs_proc,
                     f"Espectrograma acima de {fc_split:.1f} Hz - canal {canal}",
@@ -342,7 +496,7 @@ if uploaded_file is not None:
                     nperseg=nperseg,
                     noverlap=noverlap,
                 )
-                st.pyplot(fig4, use_container_width=True)
+                st.pyplot(fig_spec_high, use_container_width=True)
 
 else:
     st.info("Envie um arquivo para começar.")
