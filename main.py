@@ -169,36 +169,35 @@ def decompor_faixas(y: np.ndarray, fs: float, fc: float = 2.0, ordem: int = 4):
     return y_low, y_high
 
 
-def detectar_picos_alta_frequencia(
-    y_high: np.ndarray,
+def detectar_picos_baixa_frequencia(
+    y_low: np.ndarray,
     fs: float,
     fator_altura: float = 1.0,
-    distancia_min_s: float = 0.2,
+    distancia_min_s: float = 1.0,
+    prominencia: float | None = None,
 ):
-    altura_min = fator_altura * np.std(y_high)
+    altura_min = fator_altura * np.std(y_low)
     distancia_min_amostras = max(1, int(distancia_min_s * fs))
 
-    peaks, props = find_peaks(
-        y_high,
-        height=altura_min,
-        distance=distancia_min_amostras,
-    )
+    kwargs = {
+        "height": altura_min,
+        "distance": distancia_min_amostras,
+    }
 
+    if prominencia is not None and prominencia > 0:
+        kwargs["prominence"] = prominencia
+
+    peaks, props = find_peaks(y_low, **kwargs)
     return peaks, props
 
 
-def figura_registro_com_picos(
-    t,
-    y,
-    titulo,
-    peaks=None,
-    ylabel="Amplitude",
-):
+def figura_registro_com_linhas(t, y, titulo, tempos_eventos=None, ylabel="Amplitude"):
     fig, ax = plt.subplots(figsize=(10, 3.5))
     ax.plot(t, y)
 
-    if peaks is not None and len(peaks) > 0:
-        ax.scatter(t[peaks], y[peaks], s=30, zorder=3)
+    if tempos_eventos is not None:
+        for tp in tempos_eventos:
+            ax.axvline(tp, linestyle="--", linewidth=1.2, color="red")
 
     ax.set_title(titulo)
     ax.set_xlabel("Tempo (s)")
@@ -326,7 +325,7 @@ if uploaded_file is not None:
             step=1,
         )
 
-        st.markdown("### Detecção de picos")
+        st.markdown("### Picos na faixa < 2 Hz")
         fator_altura = st.number_input(
             "Limiar dos picos (multiplicador do desvio-padrão)",
             min_value=0.1,
@@ -334,11 +333,20 @@ if uploaded_file is not None:
             step=0.1,
         )
         distancia_min_s = st.number_input(
-            "Distância mínima entre picos (s)",
-            min_value=0.01,
-            value=0.2,
-            step=0.01,
+            "Distância mínima entre picos lentos (s)",
+            min_value=0.05,
+            value=1.0,
+            step=0.05,
         )
+        usar_prominencia = st.checkbox("Usar proeminência mínima", value=False)
+        prominencia = None
+        if usar_prominencia:
+            prominencia = st.number_input(
+                "Proeminência mínima",
+                min_value=0.001,
+                value=0.1,
+                step=0.01,
+            )
 
         st.markdown("### STFT")
         canais_escolhidos = st.multiselect(
@@ -401,19 +409,22 @@ if uploaded_file is not None:
                 fs_interp=float(fs_interp),
             )
 
-            y_0_2, y_acima_2 = decompor_faixas(
+            y_low, y_high = decompor_faixas(
                 y_proc,
                 fs_proc,
                 fc=float(fc_split),
                 ordem=int(ordem_filtro),
             )
 
-            peaks, props = detectar_picos_alta_frequencia(
-                y_acima_2,
+            peaks_low, props = detectar_picos_baixa_frequencia(
+                y_low,
                 fs_proc,
                 fator_altura=float(fator_altura),
                 distancia_min_s=float(distancia_min_s),
+                prominencia=prominencia,
             )
+
+            tempos_picos = t_proc[peaks_low]
 
         except Exception as e:
             st.error(f"Erro ao processar o canal {canal}: {e}")
@@ -423,54 +434,55 @@ if uploaded_file is not None:
         m1.metric("Amostras processadas", f"{len(y_proc)}")
         m2.metric("Fs usada (Hz)", f"{fs_proc:.2f}")
         m3.metric("Corte entre bandas (Hz)", f"{fc_split:.2f}")
-        m4.metric("Número de picos", f"{len(peaks)}")
+        m4.metric("Número de picos lentos", f"{len(peaks_low)}")
 
         with st.expander(f"Registros temporais - canal {canal}", expanded=True):
-            fig_total = figura_registro_com_picos(
+            fig_total = figura_registro_com_linhas(
                 t_proc,
                 y_proc,
                 f"Registro processado total - canal {canal}",
+                tempos_eventos=tempos_picos,
             )
             st.pyplot(fig_total, use_container_width=True)
 
             col1, col2 = st.columns(2)
 
             with col1:
-                fig_low = figura_registro_com_picos(
+                fig_low = figura_registro_com_linhas(
                     t_proc,
-                    y_0_2,
+                    y_low,
                     f"Registro 0 a {fc_split:.1f} Hz - canal {canal}",
-                    peaks=peaks,
+                    tempos_eventos=tempos_picos,
                 )
                 st.pyplot(fig_low, use_container_width=True)
 
             with col2:
-                fig_high = figura_registro_com_picos(
+                fig_high = figura_registro_com_linhas(
                     t_proc,
-                    y_acima_2,
+                    y_high,
                     f"Registro acima de {fc_split:.1f} Hz - canal {canal}",
-                    peaks=peaks,
+                    tempos_eventos=tempos_picos,
                 )
                 st.pyplot(fig_high, use_container_width=True)
 
-        with st.expander(f"Tabela de picos - canal {canal}", expanded=False):
-            if len(peaks) > 0:
+        with st.expander(f"Tabela de picos lentos - canal {canal}", expanded=False):
+            if len(peaks_low) > 0:
                 df_picos = pd.DataFrame({
-                    "indice": peaks,
-                    "tempo_s": t_proc[peaks],
-                    "amplitude_alta_freq": y_acima_2[peaks],
-                    "amplitude_baixa_freq": y_0_2[peaks],
+                    "indice": peaks_low,
+                    "tempo_s": t_proc[peaks_low],
+                    "amplitude_baixa_freq": y_low[peaks_low],
+                    "amplitude_alta_freq_mesmo_tempo": y_high[peaks_low],
                 })
                 st.dataframe(df_picos, use_container_width=True)
             else:
-                st.info("Nenhum pico detectado com os parâmetros atuais.")
+                st.info("Nenhum pico foi detectado na faixa abaixo de 2 Hz com os parâmetros atuais.")
 
         with st.expander(f"Espectrogramas - canal {canal}", expanded=True):
             col3, col4 = st.columns(2)
 
             with col3:
                 fig_spec_low = figura_espectrograma(
-                    y_0_2,
+                    y_low,
                     fs_proc,
                     f"Espectrograma 0 a {fc_split:.1f} Hz - canal {canal}",
                     fmin=0.0,
@@ -488,7 +500,7 @@ if uploaded_file is not None:
                     fmin_high = max(0.0, fmax_high - 0.5)
 
                 fig_spec_high = figura_espectrograma(
-                    y_acima_2,
+                    y_high,
                     fs_proc,
                     f"Espectrograma acima de {fc_split:.1f} Hz - canal {canal}",
                     fmin=fmin_high,
